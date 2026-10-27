@@ -4,20 +4,26 @@ Description: fdrv/aic_load_fw usb: range-check firmware-supplied message ids and
  dispatch in the USB fdrv, bound the handler-table lookup in fdrv and
  aic_load_fw, and check sta_idx/dst_idx/vlan_idx in the USB rx data
  path.
+ .
+ As on SDIO: SM_CONNECT_IND only has its ap/ch/width indices checked
+ when status_code is 0, so a failed connect still reaches the handler;
+ SCANU_RESULT_IND requires ind->length to cover the probe response fixed
+ fields; and MESH_PATH_UPDATE_IND only checks nhop_sta_idx when the
+ update is not a delete.
 Author: N Oliver <3945917+PixnBits@users.noreply.github.com>
 Forwarded: no
 Last-Update: 2026-10-26
 ---
- .../aic8800/aic8800_fdrv/rwnx_msg_rx.c        | 145 +++++++++++++++++-
+ .../aic8800/aic8800_fdrv/rwnx_msg_rx.c        | 150 +++++++++++++++++-
  .../drivers/aic8800/aic8800_fdrv/rwnx_rx.c    |  13 +-
  .../aic8800/aic_load_fw/aicbluetooth_cmds.c   |  10 +-
- 3 files changed, 161 insertions(+), 7 deletions(-)
+ 3 files changed, 166 insertions(+), 7 deletions(-)
 
 diff --git a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_msg_rx.c b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_msg_rx.c
-index e89681a..1e457c8 100644
+index e89681a..77f4093 100644
 --- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_msg_rx.c
 +++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_msg_rx.c
-@@ -1732,16 +1732,157 @@ static msg_cb_fct *msg_hdlrs[] = {
+@@ -1732,16 +1732,162 @@ static msg_cb_fct *msg_hdlrs[] = {
  /**
   *
   */
@@ -101,9 +107,12 @@ index e89681a..1e457c8 100644
 +	case SM_CONNECT_IND: {
 +		const struct sm_connect_ind *ind = RWNX_P(sm_connect_ind);
 +		RWNX_BAD(!RWNX_VIF_PRESENT(ind->vif_idx), "vif %u", ind->vif_idx);
-+		RWNX_BAD(ind->ap_idx >= RWNX_STA_MAX, "ap_idx %u", ind->ap_idx);
-+		RWNX_BAD(ind->ch_idx >= NX_CHAN_CTXT_CNT, "ch_idx %u", ind->ch_idx);
-+		RWNX_BAD(ind->width > PHY_CHNL_BW_80P80, "width %u", ind->width);
++		/* the handler only uses ap/ch/width on success; a failed connect must still reach it */
++		if (ind->status_code == 0) {
++			RWNX_BAD(ind->ap_idx >= RWNX_STA_MAX, "ap_idx %u", ind->ap_idx);
++			RWNX_BAD(ind->ch_idx >= NX_CHAN_CTXT_CNT, "ch_idx %u", ind->ch_idx);
++			RWNX_BAD(ind->width > PHY_CHNL_BW_80P80, "width %u", ind->width);
++		}
 +		RWNX_BAD((u32)ind->assoc_req_ie_len + ind->assoc_rsp_ie_len > sizeof(ind->assoc_ie_buf),
 +		       "ie lens %u+%u", ind->assoc_req_ie_len, ind->assoc_rsp_ie_len);
 +		break;
@@ -117,6 +126,7 @@ index e89681a..1e457c8 100644
 +	case SCANU_RESULT_IND: {
 +		const struct scanu_result_ind *ind = RWNX_P(scanu_result_ind);
 +		RWNX_BAD(msg->param_len < offsetof(struct scanu_result_ind, payload) ||
++		       ind->length < offsetof(struct ieee80211_mgmt, u.probe_resp.variable) ||
 +		       ind->length > msg->param_len - offsetof(struct scanu_result_ind, payload),
 +		       "scan frame len %u > param %u", ind->length, msg->param_len);
 +		RWNX_BAD(ind->sta_idx >= RWNX_STA_MAX && ind->sta_idx != 0xFF, "sta");
@@ -143,7 +153,8 @@ index e89681a..1e457c8 100644
 +		break;
 +	case MESH_PATH_UPDATE_IND:
 +		RWNX_BAD(!RWNX_VIF_PRESENT(RWNX_P(mesh_path_update_ind)->vif_idx) ||
-+		       RWNX_P(mesh_path_update_ind)->nhop_sta_idx >= RWNX_STA_MAX, "mesh idx");
++		       (!RWNX_P(mesh_path_update_ind)->delete &&
++			RWNX_P(mesh_path_update_ind)->nhop_sta_idx >= RWNX_STA_MAX), "mesh idx");
 +		break;
 +	case MESH_PROXY_UPDATE_IND:
 +		RWNX_BAD(!RWNX_VIF_PRESENT(RWNX_P(mesh_proxy_update_ind)->vif_idx), "vif");

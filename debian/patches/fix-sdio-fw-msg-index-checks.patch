@@ -4,14 +4,21 @@ Description: fdrv/bsp: range-check firmware-supplied message ids and vif/sta/cha
  Validate them against their table sizes before dispatch and drop
  messages that fail; bound the handler-table lookup in fdrv and bsp;
  check sta_idx/dst_idx and vlan_idx in the rx data path.
+ .
+ SM_CONNECT_IND only has its ap/ch/width indices checked when
+ status_code is 0, since the handler only uses them on success and a
+ failed connect must still be reported. SCANU_RESULT_IND also requires
+ ind->length to cover the probe response fixed fields
+ (offsetof(struct ieee80211_mgmt, u.probe_resp.variable)), which the
+ handler reads unconditionally.
 Author: N Oliver <3945917+PixnBits@users.noreply.github.com>
 Forwarded: no
 Last-Update: 2026-10-26
 ---
  .../aic8800/aic8800_bsp/aic_bsp_driver.c      |  10 +-
- .../driver/aic8800/aic8800_fdrv/rwnx_msg_rx.c | 140 +++++++++++++++++-
+ .../driver/aic8800/aic8800_fdrv/rwnx_msg_rx.c | 144 +++++++++++++++++-
  .../driver/aic8800/aic8800_fdrv/rwnx_rx.c     |  13 +-
- 3 files changed, 155 insertions(+), 8 deletions(-)
+ 3 files changed, 159 insertions(+), 8 deletions(-)
 
 diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.c b/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.c
 index 194c0c2..9788152 100644
@@ -35,7 +42,7 @@ index 194c0c2..9788152 100644
  
  #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
 diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_rx.c b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_rx.c
-index 2a03bf4..d83194e 100644
+index 2a03bf4..9032acd 100644
 --- a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_rx.c
 +++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_rx.c
 @@ -590,7 +590,7 @@ static inline int rwnx_rx_ps_change_ind(struct rwnx_hw *rwnx_hw,
@@ -47,7 +54,7 @@ index 2a03bf4..d83194e 100644
  		wiphy_err(rwnx_hw->wiphy, "Invalid sta index reported by fw %d\n",
  				  ind->sta_idx);
  		return 1;
-@@ -1579,12 +1579,146 @@ static msg_cb_fct *msg_hdlrs[] = {
+@@ -1579,12 +1579,150 @@ static msg_cb_fct *msg_hdlrs[] = {
  /**
   *
   */
@@ -131,9 +138,12 @@ index 2a03bf4..d83194e 100644
 +	case SM_CONNECT_IND: {
 +		const struct sm_connect_ind *ind = RWNX_P(sm_connect_ind);
 +		RWNX_BAD(!RWNX_VIF_PRESENT(ind->vif_idx), "vif %u", ind->vif_idx);
-+		RWNX_BAD(ind->ap_idx >= RWNX_STA_MAX, "ap_idx %u", ind->ap_idx);
-+		RWNX_BAD(ind->ch_idx >= NX_CHAN_CTXT_CNT, "ch_idx %u", ind->ch_idx);
-+		RWNX_BAD(ind->width > PHY_CHNL_BW_80P80, "width %u", ind->width);
++		/* the handler only uses ap/ch/width on success; a failed connect must still reach it */
++		if (ind->status_code == 0) {
++			RWNX_BAD(ind->ap_idx >= RWNX_STA_MAX, "ap_idx %u", ind->ap_idx);
++			RWNX_BAD(ind->ch_idx >= NX_CHAN_CTXT_CNT, "ch_idx %u", ind->ch_idx);
++			RWNX_BAD(ind->width > PHY_CHNL_BW_80P80, "width %u", ind->width);
++		}
 +		RWNX_BAD((u32)ind->assoc_req_ie_len + ind->assoc_rsp_ie_len > sizeof(ind->assoc_ie_buf),
 +		       "ie lens %u+%u", ind->assoc_req_ie_len, ind->assoc_rsp_ie_len);
 +		break;
@@ -147,6 +157,7 @@ index 2a03bf4..d83194e 100644
 +	case SCANU_RESULT_IND: {
 +		const struct scanu_result_ind *ind = RWNX_P(scanu_result_ind);
 +		RWNX_BAD(msg->param_len < offsetof(struct scanu_result_ind, payload) ||
++		       ind->length < offsetof(struct ieee80211_mgmt, u.probe_resp.variable) ||
 +		       ind->length > msg->param_len - offsetof(struct scanu_result_ind, payload),
 +		       "scan frame len %u > param %u", ind->length, msg->param_len);
 +		RWNX_BAD(ind->sta_idx >= RWNX_STA_MAX && ind->sta_idx != 0xFF, "sta");

@@ -5,16 +5,24 @@ Description: fdrv/bsp: limit confirmation copy to the caller's cfm buffer size
  the command is sent (rwnx_send_msg/rwnx_send_msg1 become wrapper
  macros, no call sites change) and copy at most that many bytes,
  warning on truncation.
+ .
+ The variable-length DBG_CUSTOM_MSG_CFM (CONFIG_MCU_MESSAGE) is the one
+ exception: rwnx_send_dbg_custom_msg_req() now takes the size of the
+ caller's allocation and passes it as the copy limit, and
+ handle_custom_msg() sizes that allocation from max_bytes_to_read and
+ caps the firmware-reported cfm->len at it before copying out.
 Author: N Oliver <3945917+PixnBits@users.noreply.github.com>
 Forwarded: no
 Last-Update: 2026-10-26
 ---
- .../aic8800/aic8800_bsp/aic_bsp_driver.c       | 18 ++++++++++++++----
- .../aic8800/aic8800_bsp/aic_bsp_driver.h       |  1 +
- .../driver/aic8800/aic8800_fdrv/rwnx_cmds.c    |  9 +++++++--
- .../driver/aic8800/aic8800_fdrv/rwnx_cmds.h    |  1 +
- .../driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c  | 15 +++++++++++----
- 5 files changed, 34 insertions(+), 10 deletions(-)
+ .../aic8800/aic8800_bsp/aic_bsp_driver.c      | 18 +++++++++++++----
+ .../aic8800/aic8800_bsp/aic_bsp_driver.h      |  1 +
+ .../aic8800/aic8800_fdrv/aic_priv_cmd.c       |  9 ++++++---
+ .../driver/aic8800/aic8800_fdrv/rwnx_cmds.c   |  9 +++++++--
+ .../driver/aic8800/aic8800_fdrv/rwnx_cmds.h   |  1 +
+ .../driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c | 20 +++++++++++++------
+ .../driver/aic8800/aic8800_fdrv/rwnx_msg_tx.h |  2 +-
+ 7 files changed, 44 insertions(+), 16 deletions(-)
 
 diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.c b/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.c
 index 9788152..9022ad2 100644
@@ -71,6 +79,37 @@ index df14e65..7cf2f6a 100644
  	u32 tkn;
  	u16 flags;
  	struct completion complete;
+diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/aic_priv_cmd.c b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/aic_priv_cmd.c
+index 6bf747d..fdf0eaa 100644
+--- a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/aic_priv_cmd.c
++++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/aic_priv_cmd.c
+@@ -1998,6 +1998,7 @@ enum custmsg_cmd_tag
+ int handle_custom_msg(char *command, u32 cmd_len)
+ {
+ 	int bytes_read = 0, max_bytes_to_read = 0;
++	size_t cfm_size;
+ 	struct rwnx_hw *p_rwnx_hw = NULL;
+ 	u32 cmd, len = 0, flags = 0;
+ 	char *buf = NULL;
+@@ -2044,13 +2045,15 @@ int handle_custom_msg(char *command, u32 cmd_len)
+ 	#ifdef AICWF_USB_SUPPORT
+ 	p_rwnx_hw = g_rwnx_plat->usbdev->rwnx_hw;
+ 	#endif
+-	cust_msg_cfm = (struct dbg_custom_msg_cfm *)kmalloc((offsetof(struct dbg_custom_msg_cfm, buf) + max_bytes_to_read), GFP_KERNEL);
++	cfm_size = offsetof(struct dbg_custom_msg_cfm, buf) + max_bytes_to_read;
++	cust_msg_cfm = kzalloc(cfm_size, GFP_KERNEL);
+ 	if (cust_msg_cfm == NULL) {
+ 		printk("msg cfm alloc fail\r\n");
+ 		return -2;
+ 	}
+-	rwnx_send_dbg_custom_msg_req(p_rwnx_hw, cmd, buf, len, flags, cust_msg_cfm);
+-	bytes_read = cust_msg_cfm->len;
++	rwnx_send_dbg_custom_msg_req(p_rwnx_hw, cmd, buf, len, flags, cust_msg_cfm, cfm_size);
++	/* firmware-reported length: never past what was allocated (and copied) */
++	bytes_read = min_t(u32, cust_msg_cfm->len, max_bytes_to_read);
+ 	printk("Custom msg cfm: cmd=%d, len=%d, status=%x\n", cust_msg_cfm->cmd, bytes_read, cust_msg_cfm->status);
+ 	if (bytes_read) {
+ 		memcpy(command, cust_msg_cfm->buf, bytes_read);
 diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_cmds.c b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_cmds.c
 index 36e2cb4..5423dd7 100644
 --- a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_cmds.c
@@ -104,7 +143,7 @@ index d1ba119..c616be6 100644
  	u16 flags;
  
 diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c
-index 4902ced..a336b32 100644
+index 4902ced..9f66dfa 100644
 --- a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c
 +++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c
 @@ -298,8 +298,13 @@ static void rwnx_msg_free(struct rwnx_hw *rwnx_hw, const void *msg_params)
@@ -150,3 +189,35 @@ index 4902ced..a336b32 100644
  	if (nonblock)
  		cmd->flags = RWNX_CMD_FLAG_NONBLOCK;
  	if (reqcfm)
+@@ -4761,7 +4768,7 @@ int rwnx_send_set_pkt_filter_req(struct rwnx_hw *rwnx_hw, u8_l *param)
+ #ifdef CONFIG_MCU_MESSAGE
+ int rwnx_send_dbg_custom_msg_req(struct rwnx_hw *rwnx_hw,
+                                  u32 cmd, void *buf, u32 len, u32 action,
+-                                 struct dbg_custom_msg_cfm *cfm)
++                                 struct dbg_custom_msg_cfm *cfm, size_t cfm_len)
+ {
+     struct dbg_custom_msg_req *cust_msg_req;
+ 
+@@ -4783,7 +4790,8 @@ int rwnx_send_dbg_custom_msg_req(struct rwnx_hw *rwnx_hw,
+     }
+ 
+     /* Send the DBG_CUSTOM_MSG_REQ message to LMAC FW */
+-    return rwnx_send_msg(rwnx_hw, cust_msg_req, 1, DBG_CUSTOM_MSG_CFM, cfm);
++    /* variable-length cfm: copy up to the caller's allocation, not sizeof(*cfm) */
++    return rwnx_send_msg_sz(rwnx_hw, cust_msg_req, 1, DBG_CUSTOM_MSG_CFM, cfm, cfm_len);
+ }
+ #endif
+ 
+diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.h b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.h
+index d9d812d..f2039d6 100644
+--- a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.h
++++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.h
+@@ -159,7 +159,7 @@ int rwnx_send_set_pkt_filter_req(struct rwnx_hw *rwnx_hw, u8_l *param);
+ #ifdef CONFIG_MCU_MESSAGE
+ int rwnx_send_dbg_custom_msg_req(struct rwnx_hw *rwnx_hw,
+                                  u32 cmd, void *buf, u32 len, u32 action,
+-                                 struct dbg_custom_msg_cfm *cfm);
++                                 struct dbg_custom_msg_cfm *cfm, size_t cfm_len);
+ #endif
+ int rwnx_send_dbg_set_sev_filter_req(struct rwnx_hw *rwnx_hw, u32 filter);
+ int rwnx_send_dbg_get_sys_stat_req(struct rwnx_hw *rwnx_hw,
