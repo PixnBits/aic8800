@@ -1,0 +1,152 @@
+Description: fdrv/bsp: limit confirmation copy to the caller's cfm buffer size
+ cmd_mgr_msgind() copied the firmware-reported param_len (capped only at
+ RWNX_CMD_E2AMSG_LEN_MAX) into the caller's cfm buffer, which is often a
+ much smaller stack struct. Record sizeof(*cfm) in struct rwnx_cmd when
+ the command is sent (rwnx_send_msg/rwnx_send_msg1 become wrapper
+ macros, no call sites change) and copy at most that many bytes,
+ warning on truncation.
+Author: N Oliver <3945917+PixnBits@users.noreply.github.com>
+Forwarded: no
+Last-Update: 2026-10-26
+---
+ .../aic8800/aic8800_bsp/aic_bsp_driver.c       | 18 ++++++++++++++----
+ .../aic8800/aic8800_bsp/aic_bsp_driver.h       |  1 +
+ .../driver/aic8800/aic8800_fdrv/rwnx_cmds.c    |  9 +++++++--
+ .../driver/aic8800/aic8800_fdrv/rwnx_cmds.h    |  1 +
+ .../driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c  | 15 +++++++++++----
+ 5 files changed, 34 insertions(+), 10 deletions(-)
+
+diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.c b/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.c
+index 9788152..9022ad2 100644
+--- a/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.c
++++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.c
+@@ -177,8 +177,13 @@ static int cmd_mgr_msgind(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd_e2amsg *
+ 					msg->param_len = RWNX_CMD_E2AMSG_LEN_MAX;
+ 				}
+ 
+-				if (cmd->e2a_msg && msg->param_len)
+-					memcpy(cmd->e2a_msg, &msg->param, msg->param_len);
++				if (cmd->e2a_msg && msg->param_len) {
++					u16 copy_len = min_t(u16, msg->param_len, cmd->e2a_len);
++					if (msg->param_len > cmd->e2a_len)
++						pr_warn_ratelimited("rwnx: cfm 0x%x len %u > buffer %u, truncated\n",
++								    msg->id, msg->param_len, cmd->e2a_len);
++					memcpy(cmd->e2a_msg, &msg->param, copy_len);
++				}
+ 
+ 				if (RWNX_CMD_WAIT_COMPLETE(cmd->flags))
+ 					cmd_complete(cmd_mgr, cmd);
+@@ -324,8 +329,12 @@ static void rwnx_msg_free(struct lmac_msg *msg, const void *msg_params)
+ }
+ 
+ 
+-static int rwnx_send_msg(struct aic_sdio_dev *sdiodev, const void *msg_params,
+-						 int reqcfm, lmac_msg_id_t reqid, void *cfm)
++/* copy the confirmation into the caller's buffer, never more than its real size
++ * (recorded per command at send time from sizeof(*cfm)) */
++#define RWNX_CFM_SZ(c) __builtin_choose_expr(__builtin_types_compatible_p(typeof(c), void *), (size_t)0, sizeof(*(c)))
++#define rwnx_send_msg(h, p, r, i, c) rwnx_send_msg_sz(h, p, r, i, c, RWNX_CFM_SZ(c))
++static int rwnx_send_msg_sz(struct aic_sdio_dev *sdiodev, const void *msg_params,
++						 int reqcfm, lmac_msg_id_t reqid, void *cfm, size_t cfm_len)
+ {
+ 	struct lmac_msg *msg;
+ 	struct rwnx_cmd *cmd;
+@@ -346,6 +355,7 @@ static int rwnx_send_msg(struct aic_sdio_dev *sdiodev, const void *msg_params,
+ 	cmd->reqid   = reqid;
+ 	cmd->a2e_msg = msg;
+ 	cmd->e2a_msg = cfm;
++	cmd->e2a_len = cfm ? (u16)min_t(size_t, cfm_len, 0xffff) : 0;
+ 	if (nonblock)
+ 		cmd->flags = RWNX_CMD_FLAG_NONBLOCK;
+ 	if (reqcfm)
+diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.h b/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.h
+index df14e65..7cf2f6a 100644
+--- a/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.h
++++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.h
+@@ -104,6 +104,7 @@ struct rwnx_cmd {
+ 	lmac_msg_id_t reqid;
+ 	struct rwnx_cmd_a2emsg *a2e_msg;
+ 	char *e2a_msg;
++	u16 e2a_len; /* size of the caller cfm buffer */
+ 	u32 tkn;
+ 	u16 flags;
+ 	struct completion complete;
+diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_cmds.c b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_cmds.c
+index 36e2cb4..5423dd7 100644
+--- a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_cmds.c
++++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_cmds.c
+@@ -463,8 +463,13 @@ static int cmd_mgr_msgind(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd_e2amsg *
+ 					msg->param_len = RWNX_CMD_E2AMSG_LEN_MAX;
+ 				}
+ 
+-				if (cmd->e2a_msg && msg->param_len)
+-					memcpy(cmd->e2a_msg, &msg->param, msg->param_len);
++				if (cmd->e2a_msg && msg->param_len) {
++					u16 copy_len = min_t(u16, msg->param_len, cmd->e2a_len);
++					if (msg->param_len > cmd->e2a_len)
++						pr_warn_ratelimited("rwnx: cfm 0x%x len %u > buffer %u, truncated\n",
++								    msg->id, msg->param_len, cmd->e2a_len);
++					memcpy(cmd->e2a_msg, &msg->param, copy_len);
++				}
+ 
+ 				if (RWNX_CMD_WAIT_COMPLETE(cmd->flags))
+ 					cmd_complete(cmd_mgr, cmd);
+diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_cmds.h b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_cmds.h
+index d1ba119..c616be6 100644
+--- a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_cmds.h
++++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_cmds.h
+@@ -80,6 +80,7 @@ struct rwnx_cmd {
+ 	lmac_msg_id_t reqid;
+ 	struct rwnx_cmd_a2emsg *a2e_msg;
+ 	char *e2a_msg;
++	u16 e2a_len; /* size of the caller cfm buffer */
+ 	u32 tkn;
+ 	u16 flags;
+ 
+diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c
+index 4902ced..a336b32 100644
+--- a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c
++++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c
+@@ -298,8 +298,13 @@ static void rwnx_msg_free(struct rwnx_hw *rwnx_hw, const void *msg_params)
+ //void rwnx_pm_relax(struct aic_sdio_dev *sdiodev);
+ //void rwnx_pm_stay_awake(struct aic_sdio_dev *sdiodev);
+ 
+-static int rwnx_send_msg(struct rwnx_hw *rwnx_hw, const void *msg_params,
+-						 int reqcfm, lmac_msg_id_t reqid, void *cfm)
++/* copy the confirmation into the caller's buffer, never more than its real size
++ * (recorded per command at send time from sizeof(*cfm)) */
++#define RWNX_CFM_SZ(c) __builtin_choose_expr(__builtin_types_compatible_p(typeof(c), void *), (size_t)0, sizeof(*(c)))
++#define rwnx_send_msg(h, p, r, i, c) rwnx_send_msg_sz(h, p, r, i, c, RWNX_CFM_SZ(c))
++#define rwnx_send_msg1(h, p, r, i, c, d) rwnx_send_msg1_sz(h, p, r, i, c, d, RWNX_CFM_SZ(c))
++static int rwnx_send_msg_sz(struct rwnx_hw *rwnx_hw, const void *msg_params,
++						 int reqcfm, lmac_msg_id_t reqid, void *cfm, size_t cfm_len)
+ {
+ 	struct lmac_msg *msg;
+ 	struct rwnx_cmd *cmd;
+@@ -365,6 +370,7 @@ static int rwnx_send_msg(struct rwnx_hw *rwnx_hw, const void *msg_params,
+ 	cmd->reqid   = reqid;
+ 	cmd->a2e_msg = msg;
+ 	cmd->e2a_msg = cfm;
++	cmd->e2a_len = cfm ? (u16)min_t(size_t, cfm_len, 0xffff) : 0;
+ 	if (nonblock)
+ 		cmd->flags = RWNX_CMD_FLAG_NONBLOCK;
+ 	if (reqcfm)
+@@ -410,8 +416,8 @@ static int rwnx_send_msg(struct rwnx_hw *rwnx_hw, const void *msg_params,
+ }
+ 
+ #if 0
+-static int rwnx_send_msg1(struct rwnx_hw *rwnx_hw, const void *msg_params,
+-						 int reqcfm, lmac_msg_id_t reqid, void *cfm, bool defer)
++static int rwnx_send_msg1_sz(struct rwnx_hw *rwnx_hw, const void *msg_params,
++						 int reqcfm, lmac_msg_id_t reqid, void *cfm, bool defer, size_t cfm_len)
+ {
+ 	struct lmac_msg *msg;
+ 	struct rwnx_cmd *cmd;
+@@ -437,6 +443,7 @@ static int rwnx_send_msg1(struct rwnx_hw *rwnx_hw, const void *msg_params,
+ 	cmd->reqid   = reqid;
+ 	cmd->a2e_msg = msg;
+ 	cmd->e2a_msg = cfm;
++	cmd->e2a_len = cfm ? (u16)min_t(size_t, cfm_len, 0xffff) : 0;
+ 	if (nonblock)
+ 		cmd->flags = RWNX_CMD_FLAG_NONBLOCK;
+ 	if (reqcfm)
